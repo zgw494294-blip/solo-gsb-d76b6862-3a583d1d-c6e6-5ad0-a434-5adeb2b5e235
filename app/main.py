@@ -5,7 +5,13 @@ from threading import Lock
 from typing import List, Literal, Optional, Union
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from . import storage as storage_module
 from .playback import (
@@ -16,7 +22,13 @@ from .playback import (
     SceneUnavailable,
 )
 from .solver import Subtitle, solve, validate
-from .storage import RevisionConflict, SceneRecord, SceneStore
+from .storage import (
+    RevisionConflict,
+    SceneNotFound,
+    SceneRecord,
+    SceneStore,
+    TargetSceneExists,
+)
 
 app = FastAPI(
     title="对白字幕分轨 API",
@@ -27,8 +39,11 @@ app = FastAPI(
         "播放会话（session）按 scene_id 创建内存态会话，游标推进中可接纳场景"
         "后续修订：已开始字幕保持原分轨，其余按原规则重算。事件推进接口返回"
         "一次推进跨过的全部字幕进入/退出事件，短字幕不会在两次采样之间漏掉。"
+        "片段（clip）接口把已保存场景的 [from_ms, to_ms) 时段另存为从 0 毫秒"
+        "起的独立场景：字幕裁到窗口内并平移，源分轨写入 locked_track 以保持"
+        "原画面轨道；核对源版本与创建目标为一次提交。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -98,6 +113,40 @@ class SceneRevisionRequest(AssignRequest):
     expected_revision: int = Field(
         ..., ge=0, description="所依据的当前场景版本；新场景填 0"
     )
+
+
+class ClipRequest(BaseModel):
+    """片段另存请求：把源场景的 [from_ms, to_ms) 时段另存为新场景。
+
+    from_ms/to_ms 为严格整数（StrictInt）：布尔值、字符串（含 "100"
+    这类数字串）与浮点数一律 422，不接受隐式转换。
+    """
+
+    expected_revision: int = Field(
+        ..., ge=0, description="所依据的源场景当前版本"
+    )
+    target_scene_id: str = Field(
+        ..., description="片段另存的目标场景 id：非空且未被占用"
+    )
+    from_ms: StrictInt = Field(
+        ..., ge=0, description="片段窗口起点（毫秒，非负整数，含端点）"
+    )
+    to_ms: StrictInt = Field(
+        ..., ge=0, description="片段窗口终点（毫秒，非负整数，不含端点，须大于 from_ms）"
+    )
+
+    @field_validator("target_scene_id")
+    @classmethod
+    def _target_not_blank(cls, v: str) -> str:
+        if v.strip() == "":
+            raise ValueError("target_scene_id 不能为空")
+        return v
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "ClipRequest":
+        if self.from_ms >= self.to_ms:
+            raise ValueError("from_ms 必须小于 to_ms")
+        return self
 
 
 class TrackAssignment(BaseModel):
@@ -271,6 +320,18 @@ def _check_scene_id(scene_id: str) -> None:
         raise HTTPException(status_code=422, detail="scene_id 不能为空")
 
 
+def _conflict_409(scene_id: str, current_revision: int) -> HTTPException:
+    """版本冲突的统一 409 响应（修订与片段另存共用）。"""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "message": "场景版本冲突：expected_revision 与当前版本不一致",
+            "scene_id": scene_id,
+            "current_revision": current_revision,
+        },
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -332,14 +393,7 @@ def revise_scene(
             changes=changes,
         )
     except RevisionConflict as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "场景版本冲突：expected_revision 与当前版本不一致",
-                "scene_id": exc.scene_id,
-                "current_revision": exc.current_revision,
-            },
-        )
+        raise _conflict_409(exc.scene_id, exc.current_revision)
 
     return SceneResponse(
         scene_id=scene_id,
@@ -372,6 +426,116 @@ def read_scene(scene_id: str) -> SceneResponse:
     if record is None:
         raise HTTPException(status_code=404, detail=f"场景 {scene_id!r} 不存在")
     return _record_to_scene_response(record)
+
+
+# ---------------------------------------------------------------------------
+# 片段另存：把已保存场景的 [from_ms, to_ms) 时段另存为独立场景
+# ---------------------------------------------------------------------------
+
+
+@app.post("/scenes/{scene_id}/clips", response_model=SceneResponse)
+def create_scene_clip(scene_id: str, req: ClipRequest) -> SceneResponse:
+    """把源场景的 [from_ms, to_ms) 时段另存为从 0 毫秒起的独立片段场景。
+
+    - 保留与窗口相交（左闭右开：start_ms < to_ms 且 from_ms < end_ms，
+      端点相接不算相交）的字幕，裁到窗口内后整体减去 from_ms；
+    - 字幕按源顺序保留 id、speaker，locked_track 写入源场景的分轨结果，
+      片段沿用源 track_count 与既有求解规则重算后保持原画面轨道；
+    - 目标场景以 revision=1 保存并返回完整场景，之后可用既有读取、
+      修订与播放会话接口；
+    - 核对源版本与创建目标是一次提交：源版本过期或目标已存在返回 409，
+      失败不留下目标，也不改源场景或任何播放会话；
+    - 源不存在返回 404；窗口内没有相交字幕返回 422；
+      时间字段拒绝布尔值与字符串，from_ms 必须小于 to_ms。
+    """
+    _check_scene_id(scene_id)
+    store = get_store()
+    record = store.get_scene(scene_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"场景 {scene_id!r} 不存在")
+    # 快速失败路径；权威核对在 commit_clip 的同一事务内再做一次
+    if record.revision != req.expected_revision:
+        raise _conflict_409(scene_id, record.revision)
+
+    # 与 [from_ms, to_ms) 相交的字幕裁到窗口内再平移到 0 毫秒起；
+    # locked_track 取源分轨，重算后每条字幕仍占原画面轨道。
+    track_by_id = {a["id"]: a["track"] for a in record.assignments}
+    clipped: List[Subtitle] = []
+    for sub in record.subtitles:
+        if sub["start_ms"] < req.to_ms and req.from_ms < sub["end_ms"]:
+            clipped.append(
+                Subtitle(
+                    id=sub["id"],
+                    speaker=sub["speaker"],
+                    start_ms=max(sub["start_ms"], req.from_ms) - req.from_ms,
+                    end_ms=min(sub["end_ms"], req.to_ms) - req.from_ms,
+                    locked_track=track_by_id[sub["id"]],
+                )
+            )
+    if not clipped:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"窗口 [{req.from_ms}, {req.to_ms}) 内没有相交字幕，"
+                "无法生成片段"
+            ),
+        )
+
+    # 裁剪只缩小区间，同轨重叠不会变多：源分轨作为锁定轨必然有解
+    tracks, changes = solve(clipped, record.track_count)
+    if tracks is None:  # pragma: no cover - 源快照可行则此处不可达
+        raise HTTPException(status_code=500, detail="片段重算分轨失败")
+
+    subtitles_data = [
+        {
+            "id": s.id,
+            "speaker": s.speaker,
+            "start_ms": s.start_ms,
+            "end_ms": s.end_ms,
+            "locked_track": s.locked_track,
+        }
+        for s in clipped
+    ]
+    assignments_data = [
+        {"id": s.id, "track": t} for s, t in zip(clipped, tracks)
+    ]
+
+    try:
+        new_revision = store.commit_clip(
+            source_scene_id=scene_id,
+            expected_revision=req.expected_revision,
+            target_scene_id=req.target_scene_id,
+            track_count=record.track_count,
+            subtitles=subtitles_data,
+            assignments=assignments_data,
+            changes=changes,
+        )
+    except SceneNotFound:
+        raise HTTPException(
+            status_code=404, detail=f"场景 {scene_id!r} 不存在"
+        )
+    except RevisionConflict as exc:
+        raise _conflict_409(exc.scene_id, exc.current_revision)
+    except TargetSceneExists as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "目标场景已存在：target_scene_id 必须未被占用",
+                "scene_id": exc.scene_id,
+            },
+        )
+
+    return SceneResponse(
+        scene_id=req.target_scene_id,
+        revision=new_revision,
+        track_count=record.track_count,
+        subtitles=subtitles_data,
+        changes=changes,
+        assignments=[
+            TrackAssignment(id=a["id"], track=a["track"])
+            for a in assignments_data
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------

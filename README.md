@@ -9,6 +9,7 @@
 - 同一说话人的字幕时间不得重叠（属于输入合法性约束，非法返回 422）。
 - 分轨结果可作为**场景（scene）**按 `scene_id` 保存为版本化修订：新场景以 `expected_revision: 0` 创建（成功后版本 1），后续修订须带当前版本；版本不符返回 409。数据落在本地 SQLite，容器重启后仍可读取。
 - 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。
+- 已保存场景的指定时段可另存为**片段（clip）**：`POST /scenes/{scene_id}/clips` 把源场景 `[from_ms, to_ms)` 内相交的字幕裁到窗口内、整体平移到 0 毫秒起，以 `target_scene_id` 保存为版本 1 的独立场景；源分轨写入各条 `locked_track`，片段保持原画面轨道。核对源版本与创建目标是一次提交：失败不留下目标，也不改源场景或任何播放会话。
 
 ## 一条命令启动
 
@@ -663,6 +664,169 @@ curl -s http://localhost:8080/health
 # {"status":"ok"}
 ```
 
+## 片段（clip）：把已保存场景的时段另存为独立场景
+
+`POST /scenes/{scene_id}/clips` 把源场景 `[from_ms, to_ms)` 时段另存为从 0 毫秒起的独立场景：与窗口相交的字幕裁到窗口内、整体减去 `from_ms`，以 `target_scene_id` 保存为 `revision: 1` 并返回完整场景。片段是普通场景，之后可用既有读取（`GET /scenes/...`）、修订（`PUT /scenes/...`，`expected_revision` 从 1 起）与播放会话（`POST /sessions`）接口；旧接口行为不变。
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `expected_revision` | int | 非负。所依据的**源场景当前版本** |
+| `target_scene_id` | string | 非空（不能全为空白）且未被占用 |
+| `from_ms` | int | 非负整数（严格：布尔值、字符串、浮点数一律 422） |
+| `to_ms` | int | 非负整数（严格同上），且必须大于 `from_ms` |
+
+语义与规则：
+
+- **相交判定左闭右开**：保留 `start_ms < to_ms` 且 `from_ms < end_ms` 的字幕；端点相接（`end_ms == from_ms` 或 `start_ms == to_ms`）不算相交。保留下来的字幕裁到 `[from_ms, to_ms)` 内再减去 `from_ms`，片段从 0 毫秒起。
+- **保持原画面轨道**：字幕按源顺序保留 `id`、`speaker`，源场景的分轨结果写入各条 `locked_track`；`track_count` 沿用源场景，再按既有最少换轨与并列规则重算——因此片段中每条字幕仍占原来的轨道，`changes` 按片段内剩余的说话人相邻链重新计数。
+- **一次提交**：核对源版本与创建目标在同一个事务中完成。源版本过期（`expected_revision` 与源当前版本不一致）或目标已存在返回 **409**；失败不留下目标，也不改源场景或任何播放会话。源场景对片段操作只读：同一源版本可并发导出多个不同目标的片段，同一目标的并发提交只有一次成功。
+- 源场景不存在返回 **404**；窗口内没有相交字幕、`from_ms >= to_ms`、时间为负/布尔/字符串、目标 id 为空白等返回 **422**，同样不留下目标、不改源场景。
+
+### 示例 17：裁剪另存（裁到窗口内、平移到 0 毫秒起、保持原轨道）
+
+先建一个四条字幕的源场景（分轨 s1→1、s2→2、s3→1、s4→1）：
+
+```bash
+curl -s -X PUT http://localhost:8080/scenes/scene-clip-src \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500},
+      {"id": "s4", "speaker": "Carol", "start_ms": 4000, "end_ms": 5000}
+    ]
+  }' >/dev/null
+
+# 把 [500, 2000) 时段另存为 scene-clip-1
+curl -s -X POST http://localhost:8080/scenes/scene-clip-src/clips \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 1,
+    "target_scene_id": "scene-clip-1",
+    "from_ms": 500,
+    "to_ms": 2000
+  }'
+```
+
+响应（HTTP 200）：
+
+```json
+{
+  "scene_id": "scene-clip-1",
+  "revision": 1,
+  "track_count": 2,
+  "subtitles": [
+    {"id": "s1", "speaker": "Alice", "start_ms": 0,   "end_ms": 500,  "locked_track": 1},
+    {"id": "s2", "speaker": "Bob",   "start_ms": 300, "end_ms": 1500, "locked_track": 2},
+    {"id": "s3", "speaker": "Alice", "start_ms": 500, "end_ms": 1500, "locked_track": 1}
+  ],
+  "changes": 0,
+  "assignments": [
+    {"id": "s1", "track": 1},
+    {"id": "s2", "track": 2},
+    {"id": "s3", "track": 1}
+  ],
+  "feasible": true
+}
+```
+
+说明：s4 `[4000,5000)` 与窗口不相交被丢弃；s1 裁成 `[500,1000)`、s2 裁成 `[800,2000)`、s3 裁成 `[1000,2000)`，再整体减去 500 得到从 0 毫秒起的片段时间；三条字幕的 `locked_track` 即源分轨 1/2/1，重算后 `assignments` 保持原画面轨道。源场景 `scene-clip-src` 仍是 revision 1、内容不变。
+
+### 示例 18：冲突与失败（409/422，不留下目标、不改源场景）
+
+源版本过期（源当前为 revision 1，却按 0 提交）：
+
+```bash
+curl -s -i -X POST http://localhost:8080/scenes/scene-clip-src/clips \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0, "target_scene_id": "scene-clip-2", "from_ms": 500, "to_ms": 2000}'
+```
+
+```
+HTTP/1.1 409 Conflict
+```
+
+```json
+{"detail": {"message": "场景版本冲突：expected_revision 与当前版本不一致", "scene_id": "scene-clip-src", "current_revision": 1}}
+```
+
+目标已存在（`scene-clip-1` 已由示例 17 创建，即使换一个源场景也一样）：
+
+```bash
+curl -s -i -X POST http://localhost:8080/scenes/scene-clip-src/clips \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "target_scene_id": "scene-clip-1", "from_ms": 0, "to_ms": 500}'
+# HTTP/1.1 409 Conflict
+# {"detail": {"message": "目标场景已存在：target_scene_id 必须未被占用", "scene_id": "scene-clip-1"}}
+```
+
+窗口内没有相交字幕（s2 在 3000 结束、s4 从 4000 开始，`[3000,4000)` 为空）：
+
+```bash
+curl -s -i -X POST http://localhost:8080/scenes/scene-clip-src/clips \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "target_scene_id": "scene-clip-3", "from_ms": 3000, "to_ms": 4000}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail": "窗口 [3000, 4000) 内没有相交字幕，无法生成片段"}
+```
+
+时间字段拒绝布尔值与字符串（`"from_ms": true`、`"to_ms": "2000"` 都是 422）；`from_ms >= to_ms`、负时间、空白 `target_scene_id` 同样 422。以上任何失败都不会留下目标场景（`GET /scenes/scene-clip-2` 等为 404），源场景与其播放会话保持不变。客户端应先 `GET /scenes/scene-clip-src` 取得当前版本，再带上正确的 `expected_revision` 重试。
+
+### 示例 19：播放片段（会话从 0 毫秒起，轨道与源一致）
+
+片段是普通场景，直接创建播放会话并推进：
+
+```bash
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-clip-1"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+
+# 片段时间 400 毫秒：s1[0,500) 与 s2[300,1500) 在屏，轨道保持 1、2
+curl -s -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 400}'
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "scene-clip-1",
+  "source_revision": 1,
+  "cursor_ms": 400,
+  "active": [
+    {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 500, "locked_track": 1, "track": 1},
+    {"id": "s2", "speaker": "Bob", "start_ms": 300, "end_ms": 1500, "locked_track": 2, "track": 2}
+  ]
+}
+```
+
+事件推进到片段末尾 1500（窗口 (400,1500]）：500 时刻 s1 退出与 s3 进入同刻、先退后进；1500 时刻 s2、s3 同为退出，按会话字幕顺序排列：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1500}'
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "scene-clip-1",
+  "source_revision": 1,
+  "cursor_ms": 1500,
+  "events": [
+    {"id": "s1", "speaker": "Alice", "track": 1, "time_ms": 500,  "type": "exit"},
+    {"id": "s3", "speaker": "Alice", "track": 1, "time_ms": 500,  "type": "enter"},
+    {"id": "s2", "speaker": "Bob",   "track": 2, "time_ms": 1500, "type": "exit"},
+    {"id": "s3", "speaker": "Alice", "track": 1, "time_ms": 1500, "type": "exit"}
+  ],
+  "active": []
+}
+```
+
+片段也可以继续修订（`PUT /scenes/scene-clip-1`，`expected_revision: 1`）、作为源再次裁剪（`POST /scenes/scene-clip-1/clips`），或被播放会话接纳后续修订——与任何其他场景一致。
+
 ## 本地开发与测试（不使用 Docker）
 
 需 Python 3.11+：
@@ -707,6 +871,7 @@ tests/
   test_api.py        # /assign HTTP 层测试
   test_scenes.py     # 场景创建/修订/读取/版本冲突/并发测试
   test_playback.py   # 播放会话创建/推进/接纳/冲突/并发测试
+  test_clip.py       # 片段另存：裁剪平移/原轨道保持/原子提交/错误码/并发测试
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data
 requirements.txt / requirements-dev.txt

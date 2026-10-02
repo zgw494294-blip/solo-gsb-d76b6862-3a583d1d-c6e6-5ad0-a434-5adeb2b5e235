@@ -7,6 +7,11 @@
 已存在场景须填写当前版本；服务端在一个 BEGIN IMMEDIATE 事务中
 读取当前版本并写入新版本，因此同一版本的并发提交最多一次成功，
 其余全部以 RevisionConflict 失败且不改动已有数据。
+
+片段另存（commit_clip）同样在一个 BEGIN IMMEDIATE 事务中完成：
+核对源场景当前版本与 expected_revision 一致、确认目标 scene_id
+未被占用，然后以 revision=1 写入目标场景。源场景只读不写；
+任一步失败都整体回滚，不留下目标场景。
 """
 from __future__ import annotations
 
@@ -29,6 +34,22 @@ class RevisionConflict(Exception):
             f"场景 {scene_id!r} 的版本冲突：期望新版本基于 "
             f"revision={current_revision} 再次提交"
         )
+
+
+class SceneNotFound(Exception):
+    """片段另存提交时源场景不存在（对应 HTTP 404）。"""
+
+    def __init__(self, scene_id: str) -> None:
+        self.scene_id = scene_id
+        super().__init__(f"场景 {scene_id!r} 不存在")
+
+
+class TargetSceneExists(Exception):
+    """片段另存提交时目标 scene_id 已被占用（对应 HTTP 409）。"""
+
+    def __init__(self, scene_id: str) -> None:
+        self.scene_id = scene_id
+        super().__init__(f"目标场景 {scene_id!r} 已存在")
 
 
 @dataclass
@@ -144,6 +165,67 @@ class SceneStore:
         except RevisionConflict:
             conn.rollback()
             raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def commit_clip(
+        self,
+        source_scene_id: str,
+        expected_revision: int,
+        target_scene_id: str,
+        track_count: int,
+        subtitles: List[Dict[str, Any]],
+        assignments: List[Dict[str, Any]],
+        changes: int,
+    ) -> int:
+        """核对源场景版本并创建片段场景，作为一次提交；返回目标版本（恒为 1）。
+
+        在同一个 BEGIN IMMEDIATE 事务中：读取源场景并核对
+        expected_revision 与其当前版本一致、确认 target_scene_id 未被
+        占用，然后以 revision=1 写入目标场景。源场景只读不写；任一步
+        失败都整体回滚——不留下目标场景，也不改动源场景。因此并发下
+        同一目标 scene_id 的片段提交最多一次成功，源场景在提交期间被
+        修订也会让本次提交以 RevisionConflict 失败。
+        """
+        conn = self._connect()
+        try:
+            # IMMEDIATE 立即获取保留写锁：版本核对、目标占用检查与写入
+            # 三者串行化，不会出现“核对通过后被别的提交抢先”的交错。
+            conn.execute("BEGIN IMMEDIATE")
+            src = conn.execute(
+                "SELECT revision FROM scenes WHERE scene_id = ?",
+                (source_scene_id,),
+            ).fetchone()
+            if src is None:
+                raise SceneNotFound(source_scene_id)
+            current_revision = src["revision"]
+            if expected_revision != current_revision:
+                raise RevisionConflict(source_scene_id, current_revision)
+            tgt = conn.execute(
+                "SELECT 1 FROM scenes WHERE scene_id = ?", (target_scene_id,)
+            ).fetchone()
+            if tgt is not None:
+                raise TargetSceneExists(target_scene_id)
+            conn.execute(
+                """
+                INSERT INTO scenes
+                    (scene_id, revision, track_count, subtitles, assignments, changes)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target_scene_id,
+                    1,
+                    track_count,
+                    json.dumps(subtitles, ensure_ascii=False),
+                    json.dumps(assignments, ensure_ascii=False),
+                    changes,
+                ),
+            )
+            conn.commit()
+            return 1
         except Exception:
             conn.rollback()
             raise
