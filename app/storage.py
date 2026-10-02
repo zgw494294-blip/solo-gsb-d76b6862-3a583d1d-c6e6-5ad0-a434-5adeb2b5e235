@@ -31,6 +31,26 @@ class RevisionConflict(Exception):
         )
 
 
+class TargetSceneExists(Exception):
+    """裁剪目标 scene_id 已被占用（含目标与源同名）。"""
+
+    def __init__(self, scene_id: str, current_revision: int) -> None:
+        self.scene_id = scene_id
+        self.current_revision = current_revision
+        super().__init__(
+            f"目标场景 {scene_id!r} 已存在（revision={current_revision}），"
+            "裁剪目标必须使用未占用的 scene_id"
+        )
+
+
+class SourceSceneMissing(Exception):
+    """提交裁剪事务时发现源场景不存在（正常流程中场景不可删除，仅作防御）。"""
+
+    def __init__(self, scene_id: str) -> None:
+        self.scene_id = scene_id
+        super().__init__(f"源场景 {scene_id!r} 不存在")
+
+
 @dataclass
 class SceneRecord:
     scene_id: str
@@ -142,6 +162,82 @@ class SceneStore:
             conn.commit()
             return new_revision
         except RevisionConflict:
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def commit_clip(
+        self,
+        source_scene_id: str,
+        target_scene_id: str,
+        expected_revision: int,
+        track_count: int,
+        subtitles: List[Dict[str, Any]],
+        assignments: List[Dict[str, Any]],
+        changes: int,
+    ) -> SceneRecord:
+        """在单个 BEGIN IMMEDIATE 事务内核对源版本、占用目标并写入片段。
+
+        片段始终以 revision=1 作为全新场景写入。事务内依次完成：
+        1. 源场景必须存在且 revision == expected_revision；
+        2. target_scene_id 必须尚未被任何场景占用（包括源/目标同名）；
+        3. INSERT 目标片段。
+
+        任一条件不满足都在提交前抛错回滚：失败不会留下目标，也不会改动
+        源场景。源与目标的版本核对被同一把写锁串行化，并发裁剪/修订不会
+        在“读到源、提交目标”之间被插入过期窗口。
+        返回已提交的目标场景记录（revision=1）。
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            source_row = conn.execute(
+                "SELECT revision FROM scenes WHERE scene_id = ?",
+                (source_scene_id,),
+            ).fetchone()
+            if source_row is None:
+                raise SourceSceneMissing(source_scene_id)
+            current_revision = source_row["revision"]
+            if expected_revision != current_revision:
+                raise RevisionConflict(source_scene_id, current_revision)
+
+            target_row = conn.execute(
+                "SELECT revision FROM scenes WHERE scene_id = ?",
+                (target_scene_id,),
+            ).fetchone()
+            if target_row is not None:
+                raise TargetSceneExists(
+                    target_scene_id, target_row["revision"]
+                )
+
+            conn.execute(
+                """
+                INSERT INTO scenes
+                    (scene_id, revision, track_count, subtitles, assignments, changes)
+                VALUES (?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    target_scene_id,
+                    track_count,
+                    json.dumps(subtitles, ensure_ascii=False),
+                    json.dumps(assignments, ensure_ascii=False),
+                    changes,
+                ),
+            )
+            conn.commit()
+            return SceneRecord(
+                scene_id=target_scene_id,
+                revision=1,
+                track_count=track_count,
+                subtitles=[dict(s) for s in subtitles],
+                assignments=[dict(a) for a in assignments],
+                changes=changes,
+            )
+        except (RevisionConflict, TargetSceneExists, SourceSceneMissing):
             conn.rollback()
             raise
         except Exception:
